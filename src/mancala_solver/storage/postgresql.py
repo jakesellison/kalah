@@ -6,6 +6,20 @@ from typing import List, Optional, Iterator
 from .base import StorageBackend, Position
 
 
+def _to_signed_int64(n: int) -> int:
+    """Convert unsigned 64-bit to signed 64-bit for PostgreSQL BIGINT."""
+    if n > 0x7FFFFFFFFFFFFFFF:  # If > 2^63 - 1
+        return n - 0x10000000000000000  # Subtract 2^64 to make negative
+    return n
+
+
+def _from_signed_int64(n: int) -> int:
+    """Convert signed 64-bit from PostgreSQL BIGINT to unsigned."""
+    if n < 0:
+        return n + 0x10000000000000000  # Add 2^64
+    return n
+
+
 class PostgreSQLBackend(StorageBackend):
     """
     PostgreSQL storage implementation.
@@ -24,6 +38,7 @@ class PostgreSQLBackend(StorageBackend):
         database: str = "mancala",
         user: str = "postgres",
         password: str = "",
+        unlogged: bool = True,
     ):
         """
         Initialize PostgreSQL backend.
@@ -34,6 +49,7 @@ class PostgreSQLBackend(StorageBackend):
             database: Database name
             user: Database user
             password: Database password
+            unlogged: Use UNLOGGED tables (3-5× faster writes, no crash recovery)
         """
         # Store connection parameters for worker processes
         self.host = host
@@ -41,6 +57,7 @@ class PostgreSQLBackend(StorageBackend):
         self.database = database
         self.user = user
         self.password = password
+        self.unlogged = unlogged
 
         self.conn = psycopg2.connect(
             host=host,
@@ -55,10 +72,11 @@ class PostgreSQLBackend(StorageBackend):
 
     def _create_schema(self) -> None:
         """Create database schema."""
+        unlogged_keyword = "UNLOGGED" if self.unlogged else ""
         with self.conn.cursor() as cursor:
             cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS positions (
+                f"""
+                CREATE {unlogged_keyword} TABLE IF NOT EXISTS positions (
                     state_hash BIGINT PRIMARY KEY,           -- 8 bytes (was NUMERIC 20 bytes)
                     state BYTEA NOT NULL,                     -- 9 bytes (board state)
                     depth INTEGER NOT NULL,                   -- 4 bytes (BFS depth)
@@ -92,7 +110,7 @@ class PostgreSQLBackend(StorageBackend):
                     INSERT INTO positions (state_hash, state, depth, seeds_in_pits)
                     VALUES (%s, %s, %s, %s)
                 """,
-                    (position.state_hash, position.state, position.depth, position.seeds_in_pits),
+                    (_to_signed_int64(position.state_hash), position.state, position.depth, position.seeds_in_pits),
                 )
                 return True
         except psycopg2.IntegrityError:  # Duplicate primary key
@@ -113,7 +131,7 @@ class PostgreSQLBackend(StorageBackend):
                 VALUES %s
                 ON CONFLICT (state_hash) DO NOTHING
             """,
-                [(p.state_hash, p.state, p.depth, p.seeds_in_pits) for p in positions],
+                [(_to_signed_int64(p.state_hash), p.state, p.depth, p.seeds_in_pits) for p in positions],
                 page_size=1000,
             )
             return cursor.rowcount if cursor.rowcount > 0 else len(positions)
@@ -122,7 +140,7 @@ class PostgreSQLBackend(StorageBackend):
         """Check if position exists."""
         with self.conn.cursor() as cursor:
             cursor.execute(
-                "SELECT 1 FROM positions WHERE state_hash = %s", (state_hash,)
+                "SELECT 1 FROM positions WHERE state_hash = %s", (_to_signed_int64(state_hash),)
             )
             return cursor.fetchone() is not None
 
@@ -130,12 +148,12 @@ class PostgreSQLBackend(StorageBackend):
         """Retrieve position by hash."""
         with self.conn.cursor() as cursor:
             cursor.execute(
-                "SELECT * FROM positions WHERE state_hash = %s", (state_hash,)
+                "SELECT * FROM positions WHERE state_hash = %s", (_to_signed_int64(state_hash),)
             )
             row = cursor.fetchone()
             if row:
                 return Position(
-                    state_hash=row[0],
+                    state_hash=_from_signed_int64(row[0]),
                     state=bytes(row[1]),
                     depth=row[2],
                     seeds_in_pits=row[3],
@@ -150,7 +168,7 @@ class PostgreSQLBackend(StorageBackend):
             cursor.execute("SELECT * FROM positions WHERE depth = %s", (depth,))
             for row in cursor:
                 yield Position(
-                    state_hash=row[0],
+                    state_hash=_from_signed_int64(row[0]),
                     state=bytes(row[1]),
                     depth=row[2],
                     seeds_in_pits=row[3],
@@ -175,7 +193,7 @@ class PostgreSQLBackend(StorageBackend):
             for row in cursor:
                 positions.append(
                     Position(
-                        state_hash=row[0],
+                        state_hash=_from_signed_int64(row[0]),
                         state=bytes(row[1]),
                         depth=row[2],
                         seeds_in_pits=row[3],
@@ -193,7 +211,7 @@ class PostgreSQLBackend(StorageBackend):
             )
             for row in cursor:
                 yield Position(
-                    state_hash=row[0],
+                    state_hash=_from_signed_int64(row[0]),
                     state=bytes(row[1]),
                     depth=row[2],
                     seeds_in_pits=row[3],
@@ -218,7 +236,7 @@ class PostgreSQLBackend(StorageBackend):
             for row in cursor:
                 positions.append(
                     Position(
-                        state_hash=row[0],
+                        state_hash=_from_signed_int64(row[0]),
                         state=bytes(row[1]),
                         depth=row[2],
                         seeds_in_pits=row[3],
@@ -251,7 +269,7 @@ class PostgreSQLBackend(StorageBackend):
                 SET minimax_value = %s, best_move = %s
                 WHERE state_hash = %s
             """,
-                (minimax_value, best_move, state_hash),
+                (minimax_value, best_move, _to_signed_int64(state_hash)),
             )
 
     def count_positions(self, depth: Optional[int] = None) -> int:

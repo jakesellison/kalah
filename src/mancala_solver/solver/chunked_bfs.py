@@ -13,7 +13,7 @@ PostgreSQL Optimizations:
 
 import logging
 import threading
-from queue import Queue
+from queue import Queue, Empty
 from typing import List, Optional
 from tqdm import tqdm
 
@@ -44,6 +44,8 @@ class AsyncWriter:
         self.queue: Queue = Queue(maxsize=1000)  # Bounded to prevent memory explosion
         self.total_queued = 0
         self.total_written = 0
+        self.batches_since_flush = 0
+        self.flush_every_n_batches = 5  # Flush less frequently for better throughput
         self.stop_flag = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.error: Optional[Exception] = None
@@ -61,19 +63,28 @@ class AsyncWriter:
                     # Wait up to 0.1s for item (allows checking stop_flag)
                     batch = self.queue.get(timeout=0.1)
                     if batch is None:  # Sentinel value to stop
+                        self.storage.flush()  # Final flush
                         break
 
                     # Write batch to database
                     self.storage.insert_batch(batch)
-                    self.storage.flush()
+                    self.batches_since_flush += 1
+
+                    # Flush less frequently (every N batches) for better throughput
+                    if self.batches_since_flush >= self.flush_every_n_batches:
+                        self.storage.flush()
+                        self.batches_since_flush = 0
+
                     self.total_written += len(batch)
                     self.queue.task_done()
 
+                except Empty:
+                    # Normal - queue is empty, keep waiting
+                    continue
                 except Exception as e:
-                    if not self.stop_flag.is_set():
-                        logger.error(f"AsyncWriter error: {e}")
-                        self.error = e
-                        break
+                    logger.error(f"AsyncWriter error: {e}")
+                    self.error = e
+                    break
         except Exception as e:
             logger.error(f"AsyncWriter fatal error: {e}")
             self.error = e
@@ -89,6 +100,8 @@ class AsyncWriter:
     def wait_until_empty(self) -> None:
         """Block until all queued writes complete."""
         self.queue.join()
+        # Flush any pending batches
+        self.storage.flush()
 
         if self.error:
             raise self.error
@@ -120,7 +133,7 @@ class ChunkedBFSSolver:
         num_pits: int,
         num_seeds: int,
         num_workers: int = 1,
-        chunk_size: int = 50_000,
+        chunk_size: int = 100_000,
     ):
         """
         Initialize chunked BFS solver.
@@ -172,41 +185,59 @@ class ChunkedBFSSolver:
         self.storage.flush()
         logger.info("Inserted starting position")
 
-        current_depth = 0
-        total_positions = 1
+        # Create ONE AsyncWriter for entire BFS (reuse across all depths)
+        async_writer = AsyncWriter(self.storage)
+        async_writer.start()
+        logger.info("Async writer started (will be reused for all depths)")
 
-        while True:
-            # Count positions at current depth
-            positions_at_depth = self.storage.count_positions(depth=current_depth)
+        try:
+            current_depth = 0
+            total_positions = 1
 
-            if positions_at_depth == 0:
-                logger.info(f"Depth {current_depth}: No positions - BFS complete")
-                break
+            while True:
+                # Count positions at current depth
+                positions_at_depth = self.storage.count_positions(depth=current_depth)
 
-            logger.info(
-                f"Depth {current_depth}: Processing {positions_at_depth:,} positions in chunks"
-            )
+                if positions_at_depth == 0:
+                    logger.info(f"Depth {current_depth}: No positions - BFS complete")
+                    break
 
-            # Process this depth in chunks
-            new_positions_count = self._process_depth_chunked(current_depth, positions_at_depth)
+                logger.info(
+                    f"Depth {current_depth}: Processing {positions_at_depth:,} positions in chunks"
+                )
 
-            total_positions += new_positions_count
-            logger.info(
-                f"Depth {current_depth}: Generated {new_positions_count:,} new positions (total: {total_positions:,})"
-            )
+                # Process this depth in chunks
+                new_positions_count = self._process_depth_chunked(
+                    current_depth, positions_at_depth, async_writer
+                )
 
-            current_depth += 1
+                total_positions += new_positions_count
+                logger.info(
+                    f"Depth {current_depth}: Generated {new_positions_count:,} new positions (total: {total_positions:,})"
+                )
+
+                current_depth += 1
+
+        finally:
+            # Stop writer at end of ALL depths
+            logger.info("Waiting for all async writes to complete...")
+            async_writer.wait_until_empty()
+            async_writer.stop()
+            logger.info(f"All writes complete: {async_writer.total_written:,} positions written")
 
         logger.info(f"Chunked BFS complete! Total positions: {total_positions:,}")
         return total_positions
 
-    def _process_depth_chunked(self, depth: int, total_at_depth: int) -> int:
+    def _process_depth_chunked(
+        self, depth: int, total_at_depth: int, async_writer: AsyncWriter
+    ) -> int:
         """
         Process all positions at a depth in chunks.
 
         Args:
             depth: Current depth to process
             total_at_depth: Total positions at this depth
+            async_writer: Shared AsyncWriter for all depths
 
         Returns:
             Number of new positions generated
@@ -215,11 +246,6 @@ class ChunkedBFSSolver:
 
         # Calculate logging interval for intra-depth progress
         log_interval = max(1, min(100, num_chunks // 10))
-
-        # Start async writer
-        async_writer = AsyncWriter(self.storage)
-        async_writer.start()
-        logger.info(f"Async writer started: database writes will not block chunk processing")
 
         total_inserted = 0
         offset = 0
@@ -289,11 +315,8 @@ class ChunkedBFSSolver:
 
                 offset += self.chunk_size
 
-        # Wait for async writes to complete before counting
-        logger.info(f"Waiting for async writes to complete...")
+        # Wait for async writes to complete before counting (don't stop writer - reuse for next depth!)
         async_writer.wait_until_empty()
-        async_writer.stop()
-        logger.info(f"All writes complete: {async_writer.total_written:,} positions written")
 
         # Final count from database
         final_count = self.storage.count_positions(depth=depth + 1)
