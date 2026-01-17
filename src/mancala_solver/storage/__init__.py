@@ -1,7 +1,6 @@
-"""Storage backends for position databases."""
+"""PostgreSQL storage backend for position databases."""
 
 from .base import StorageBackend, Position
-from .sqlite import SQLiteBackend
 from .postgresql import PostgreSQLBackend
 
-__all__ = ["StorageBackend", "Position", "SQLiteBackend", "PostgreSQLBackend"]
+__all__ = ["StorageBackend", "Position", "PostgreSQLBackend"]

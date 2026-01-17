@@ -8,8 +8,8 @@ import sys
 import os
 from pathlib import Path
 
-from ..storage import SQLiteBackend, PostgreSQLBackend
-from ..solver import BFSSolver, MinimaxSolver, ChunkedBFSSolver, ParallelMinimaxSolver
+from ..storage import PostgreSQLBackend
+from ..solver import ChunkedBFSSolver, ParallelMinimaxSolver
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -22,7 +22,7 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def solve_command(args):
-    """Solve a Kalah variant."""
+    """Solve a Kalah variant using PostgreSQL."""
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
 
@@ -33,39 +33,25 @@ def solve_command(args):
     logger.info(f"Solving Kalah({args.num_pits},{args.num_seeds})")
     logger.info(f"BFS workers: {bfs_workers}, Minimax workers: {minimax_workers}")
 
-    # Initialize storage
-    if args.backend == "sqlite":
-        db_path = Path(args.db_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Backend: SQLite ({args.db_path})")
-        storage = SQLiteBackend(str(db_path))
-    elif args.backend == "postgresql":
-        logger.info(f"Backend: PostgreSQL ({args.pg_host}:{args.pg_port}/{args.pg_database})")
-        storage = PostgreSQLBackend(
-            host=args.pg_host,
-            port=args.pg_port,
-            database=args.pg_database,
-            user=args.pg_user,
-            password=args.pg_password,
-        )
-    else:
-        raise ValueError(f"Unknown backend: {args.backend}")
+    # Initialize PostgreSQL storage
+    logger.info(f"Backend: PostgreSQL ({args.pg_host}:{args.pg_port}/{args.pg_database})")
+    storage = PostgreSQLBackend(
+        host=args.pg_host,
+        port=args.pg_port,
+        database=args.pg_database,
+        user=args.pg_user,
+        password=args.pg_password,
+    )
 
     try:
-        # Phase 1: BFS
-        if bfs_workers > 1:
-            logger.info("Using chunked parallel BFS solver (memory-efficient)")
-            bfs_solver = ChunkedBFSSolver(
-                storage=storage,
-                num_pits=args.num_pits,
-                num_seeds=args.num_seeds,
-                num_workers=bfs_workers,
-            )
-        else:
-            logger.info("Using sequential BFS solver")
-            bfs_solver = BFSSolver(
-                storage=storage, num_pits=args.num_pits, num_seeds=args.num_seeds
-            )
+        # Phase 1: Chunked BFS
+        logger.info("Using chunked parallel BFS solver (memory-efficient, async writes)")
+        bfs_solver = ChunkedBFSSolver(
+            storage=storage,
+            num_pits=args.num_pits,
+            num_seeds=args.num_seeds,
+            num_workers=bfs_workers,
+        )
 
         logger.info("=" * 60)
         logger.info("PHASE 1: Building game graph (BFS)")
@@ -73,7 +59,7 @@ def solve_command(args):
         total_positions = bfs_solver.build_game_graph()
 
         # Optional: Cluster table before minimax for better performance
-        if args.cluster_before_minimax and args.backend == "postgresql":
+        if args.cluster_before_minimax:
             logger.info("=" * 60)
             logger.info("CLUSTERING: Reorganizing table for minimax performance")
             logger.info("=" * 60)
@@ -96,24 +82,18 @@ def solve_command(args):
 
             logger.info("Clustering complete! Minimax queries will be faster.")
 
-        # Phase 2: Minimax
+        # Phase 2: Parallel Minimax with batching
         logger.info("=" * 60)
         logger.info("PHASE 2: Computing minimax values")
         logger.info("=" * 60)
+        logger.info(f"Using parallel minimax solver with position batching")
 
-        if minimax_workers > 1:
-            logger.info("Using parallel minimax solver")
-            minimax_solver = ParallelMinimaxSolver(
-                storage=storage,
-                num_pits=args.num_pits,
-                num_seeds=args.num_seeds,
-                num_workers=minimax_workers,
-            )
-        else:
-            logger.info("Using sequential minimax solver")
-            minimax_solver = MinimaxSolver(
-                storage=storage, num_pits=args.num_pits, num_seeds=args.num_seeds
-            )
+        minimax_solver = ParallelMinimaxSolver(
+            storage=storage,
+            num_pits=args.num_pits,
+            num_seeds=args.num_seeds,
+            num_workers=minimax_workers,
+        )
 
         starting_value = minimax_solver.solve()
 
@@ -136,25 +116,19 @@ def solve_command(args):
 
 
 def query_command(args):
-    """Query a solved database."""
+    """Query a solved PostgreSQL database."""
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
 
-    # Initialize storage
-    if args.backend == "sqlite":
-        logger.info(f"Backend: SQLite ({args.db_path})")
-        storage = SQLiteBackend(args.db_path)
-    elif args.backend == "postgresql":
-        logger.info(f"Backend: PostgreSQL ({args.pg_host}:{args.pg_port}/{args.pg_database})")
-        storage = PostgreSQLBackend(
-            host=args.pg_host,
-            port=args.pg_port,
-            database=args.pg_database,
-            user=args.pg_user,
-            password=args.pg_password,
-        )
-    else:
-        raise ValueError(f"Unknown backend: {args.backend}")
+    # Initialize PostgreSQL storage
+    logger.info(f"Backend: PostgreSQL ({args.pg_host}:{args.pg_port}/{args.pg_database})")
+    storage = PostgreSQLBackend(
+        host=args.pg_host,
+        port=args.pg_port,
+        database=args.pg_database,
+        user=args.pg_user,
+        password=args.pg_password,
+    )
 
     try:
         total = storage.count_positions()
@@ -183,52 +157,40 @@ def query_command(args):
 
 
 def minimax_command(args):
-    """Run minimax on existing positions."""
+    """Run minimax on existing PostgreSQL positions."""
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
 
     logger.info(f"Running minimax for Kalah({args.num_pits},{args.num_seeds})")
     logger.info(f"Workers: {args.workers}")
 
-    # Initialize storage
-    if args.backend == "sqlite":
-        logger.info(f"Backend: SQLite ({args.db_path})")
-        storage = SQLiteBackend(args.db_path)
-    elif args.backend == "postgresql":
-        logger.info(f"Backend: PostgreSQL ({args.pg_host}:{args.pg_port}/{args.pg_database})")
-        storage = PostgreSQLBackend(
-            host=args.pg_host,
-            port=args.pg_port,
-            database=args.pg_database,
-            user=args.pg_user,
-            password=args.pg_password,
-        )
-    else:
-        raise ValueError(f"Unknown backend: {args.backend}")
+    # Initialize PostgreSQL storage
+    logger.info(f"Backend: PostgreSQL ({args.pg_host}:{args.pg_port}/{args.pg_database})")
+    storage = PostgreSQLBackend(
+        host=args.pg_host,
+        port=args.pg_port,
+        database=args.pg_database,
+        user=args.pg_user,
+        password=args.pg_password,
+    )
 
     try:
         # Get total positions
         total_positions = storage.count_positions()
         logger.info(f"Total positions in database: {total_positions:,}")
 
-        # Phase 2: Minimax only
+        # Phase 2: Parallel Minimax with batching
         logger.info("=" * 60)
         logger.info("PHASE 2: Computing minimax values")
         logger.info("=" * 60)
+        logger.info(f"Using parallel minimax solver with position batching")
 
-        if args.workers > 1:
-            logger.info("Using parallel minimax solver")
-            minimax_solver = ParallelMinimaxSolver(
-                storage=storage,
-                num_pits=args.num_pits,
-                num_seeds=args.num_seeds,
-                num_workers=args.workers,
-            )
-        else:
-            logger.info("Using sequential minimax solver")
-            minimax_solver = MinimaxSolver(
-                storage=storage, num_pits=args.num_pits, num_seeds=args.num_seeds
-            )
+        minimax_solver = ParallelMinimaxSolver(
+            storage=storage,
+            num_pits=args.num_pits,
+            num_seeds=args.num_seeds,
+            num_workers=args.workers,
+        )
 
         starting_value = minimax_solver.solve()
 
@@ -262,23 +224,12 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Solve command
-    solve_parser = subparsers.add_parser("solve", help="Solve a Kalah variant")
+    solve_parser = subparsers.add_parser("solve", help="Solve a Kalah variant using PostgreSQL")
     solve_parser.add_argument(
         "--num-pits", type=int, required=True, help="Number of pits per player"
     )
     solve_parser.add_argument(
         "--num-seeds", type=int, required=True, help="Initial seeds per pit"
-    )
-    solve_parser.add_argument(
-        "--backend",
-        choices=["sqlite", "postgresql"],
-        default="sqlite",
-        help="Storage backend to use",
-    )
-    solve_parser.add_argument(
-        "--db-path",
-        default="data/databases/kalah.db",
-        help="Path to database file (SQLite only)",
     )
     solve_parser.add_argument(
         "--pg-host", default="localhost", help="PostgreSQL host"
@@ -306,23 +257,14 @@ def main():
     )
     solve_parser.add_argument(
         "--cluster-before-minimax", action="store_true",
-        help="Run CLUSTER command on positions table before minimax (PostgreSQL only, improves minimax performance)"
+        help="Run CLUSTER command to reorganize table before minimax (improves performance 20-40%)"
     )
     solve_parser.set_defaults(func=solve_command)
 
     # Query command
-    query_parser = subparsers.add_parser("query", help="Query a solved database")
+    query_parser = subparsers.add_parser("query", help="Query a solved PostgreSQL database")
     query_parser.add_argument("--num-pits", type=int, required=True)
     query_parser.add_argument("--num-seeds", type=int, required=True)
-    query_parser.add_argument(
-        "--backend",
-        choices=["sqlite", "postgresql"],
-        default="sqlite",
-        help="Storage backend to use",
-    )
-    query_parser.add_argument(
-        "--db-path", help="Path to database file (SQLite only)"
-    )
     query_parser.add_argument(
         "--pg-host", default="localhost", help="PostgreSQL host"
     )
@@ -341,18 +283,9 @@ def main():
     query_parser.set_defaults(func=query_command)
 
     # Minimax-only command
-    minimax_parser = subparsers.add_parser("minimax", help="Run minimax on existing positions")
+    minimax_parser = subparsers.add_parser("minimax", help="Run minimax on existing PostgreSQL positions")
     minimax_parser.add_argument("--num-pits", type=int, required=True)
     minimax_parser.add_argument("--num-seeds", type=int, required=True)
-    minimax_parser.add_argument(
-        "--backend",
-        choices=["sqlite", "postgresql"],
-        default="sqlite",
-        help="Storage backend to use",
-    )
-    minimax_parser.add_argument(
-        "--db-path", help="Path to database file (SQLite only)"
-    )
     minimax_parser.add_argument(
         "--pg-host", default="localhost", help="PostgreSQL host"
     )
