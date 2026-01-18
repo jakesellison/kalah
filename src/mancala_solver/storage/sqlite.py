@@ -285,7 +285,7 @@ class SQLiteBackend(StorageBackend):
         """Commit pending transactions and auto-checkpoint WAL if needed."""
         self.conn.commit()
         # Memory-based WAL checkpoint to prevent balloon
-        self._check_wal_size()
+        # DISABLED FOR TESTING: self._check_wal_size()
 
     def close(self) -> None:
         """Close database connection."""
