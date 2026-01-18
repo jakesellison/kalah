@@ -314,7 +314,7 @@ class SolverMonitor:
         layout.split_column(
             Layout(name="header", size=3),
             Layout(name="body"),
-            Layout(name="footer", size=8)
+            Layout(name="footer", size=15)
         )
 
         # Header
@@ -401,17 +401,42 @@ class SolverMonitor:
                 if self.depth_positions_generated > 0:
                     stats_table.add_row("Positions Generated", f"{self.depth_positions_generated:,}")
 
-            # ETA calculation for BFS (rough estimate)
+            # ETA calculation for BFS (distribution-aware)
             if self.start_time and len(self.depth_history) > 5:
                 elapsed = (datetime.now() - self.start_time).total_seconds()
-                depths_per_sec = self.current_depth / elapsed if elapsed > 0 else 0
-                # Estimate max depth as current + some buffer (BFS slows at end)
-                estimated_max = max(self.max_depth, self.current_depth + 10)
-                remaining_depths = estimated_max - self.current_depth
-                if depths_per_sec > 0 and remaining_depths > 0:
-                    eta_seconds = remaining_depths / depths_per_sec
+
+                # Detect if we've passed the peak depth (positions start shrinking)
+                recent_depths = self.depth_history[-5:]
+                is_growing = recent_depths[-1][1] > recent_depths[0][1]
+
+                # Calculate positions/sec rate
+                positions_per_sec = self.total_positions / elapsed if elapsed > 0 else 0
+
+                if is_growing:
+                    # Still growing: estimate we're at 40% of total work
+                    # (peak is around 50%, tail is another 10%)
+                    estimated_total_positions = self.total_positions / 0.4
+                    remaining_positions = estimated_total_positions - self.total_positions
+                    eta_desc = "growing phase"
+                else:
+                    # Past peak: estimate we're at 60-90% done based on shrink rate
+                    # Calculate shrink rate from last 3 depths
+                    if len(recent_depths) >= 3:
+                        shrink_ratio = recent_depths[-1][1] / recent_depths[-3][1]
+                        # If shrinking fast (ratio < 0.5), we're near end (assume 80% done)
+                        # If shrinking slow (ratio > 0.8), we're mid-tail (assume 65% done)
+                        pct_complete = 0.60 + (1.0 - shrink_ratio) * 0.3  # 60-90%
+                        estimated_total_positions = self.total_positions / pct_complete
+                        remaining_positions = estimated_total_positions - self.total_positions
+                        eta_desc = "decay phase"
+                    else:
+                        remaining_positions = self.total_positions * 0.3  # rough fallback
+                        eta_desc = "estimated"
+
+                if positions_per_sec > 0:
+                    eta_seconds = remaining_positions / positions_per_sec
                     eta = timedelta(seconds=int(eta_seconds))
-                    stats_table.add_row("Est. Time Left", str(eta).split('.')[0])
+                    stats_table.add_row("Est. Time Left", f"{str(eta).split('.')[0]} ({eta_desc})")
 
         elif self.phase == "Minimax":
             stats_table.add_row("Seeds Processed", f"{self.seeds_solved} / {self.max_seeds_in_pits + 1}")
@@ -538,18 +563,32 @@ class SolverMonitor:
         else:
             layout["progress"].update(Panel("Waiting for data...", border_style="white"))
 
-        # Footer - recent log lines
-        footer_lines = []
+        # Footer - recent log lines with color coding
+        footer_text = Text()
         try:
             with open(self.log_file, 'r') as f:
                 lines = f.readlines()
-                # Get last 5 log lines (filter out progress bar noise)
-                log_lines = [l.strip() for l in lines if 'INFO' in l or 'ERROR' in l]
-                footer_lines = log_lines[-5:]
-        except:
-            footer_lines = ["Waiting for log file..."]
+                # Get last 12 log lines (filter out progress bar noise)
+                log_lines = [l.strip() for l in lines if 'INFO' in l or 'ERROR' in l or 'WARNING' in l]
+                recent_lines = log_lines[-12:]
 
-        footer_text = "\n".join(footer_lines[-5:])
+                for i, line in enumerate(recent_lines):
+                    # Color code based on log level
+                    if 'ERROR' in line:
+                        footer_text.append(line, style="bold red")
+                    elif 'WARNING' in line:
+                        footer_text.append(line, style="bold yellow")
+                    elif 'INFO' in line:
+                        footer_text.append(line, style="white")
+                    else:
+                        footer_text.append(line, style="dim white")
+
+                    # Add newline except for last line
+                    if i < len(recent_lines) - 1:
+                        footer_text.append("\n")
+        except:
+            footer_text.append("Waiting for log file...", style="dim white")
+
         layout["footer"].update(Panel(footer_text, title="📝 Recent Logs", border_style="white"))
 
         return layout
@@ -564,9 +603,26 @@ class SolverMonitor:
 
         time.sleep(1)
 
+        # Pre-parse entire log file to capture history
+        try:
+            with open(self.log_file, 'r') as f:
+                for line in f:
+                    self.parse_log_line(line)
+            self.console.print("[dim]Parsed existing log history[/dim]\n")
+        except FileNotFoundError:
+            pass
+
         with Live(self.create_dashboard(), refresh_per_second=2, console=self.console) as live:
             file_pos = 0
             try:
+                # Get current file position after initial parse
+                try:
+                    with open(self.log_file, 'r') as f:
+                        f.seek(0, 2)  # Seek to end
+                        file_pos = f.tell()
+                except FileNotFoundError:
+                    file_pos = 0
+
                 while True:
                     # Read new lines from log
                     try:

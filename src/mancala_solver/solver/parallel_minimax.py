@@ -35,15 +35,10 @@ _worker_num_pits = None
 def _worker_init(backend_type: str, backend_params: dict, num_pits: int) -> None:
     """Initialize worker process with its own storage connection."""
     global _worker_storage, _worker_num_pits
-    from ..storage import SQLiteBackend, PostgreSQLBackend
+    from ..storage import SQLiteBackend
 
-    if backend_type == "sqlite":
-        _worker_storage = SQLiteBackend(backend_params["db_path"])
-    elif backend_type == "postgresql":
-        _worker_storage = PostgreSQLBackend(**backend_params)
-    else:
-        raise ValueError(f"Unknown backend type: {backend_type}")
-
+    # Workers don't create schema - main process already did
+    _worker_storage = SQLiteBackend(backend_params["db_path"], create_schema=False)
     _worker_num_pits = num_pits
     init_zobrist_table(num_pits)
 
@@ -163,22 +158,10 @@ class ParallelMinimaxSolver:
             self.memory_monitor = None
 
         # Detect backend type and extract parameters for workers
-        from ..storage import SQLiteBackend, PostgreSQLBackend
+        from ..storage import SQLiteBackend
 
-        if isinstance(storage, SQLiteBackend):
-            self.backend_type = "sqlite"
-            self.backend_params = {"db_path": storage.db_path}
-        elif isinstance(storage, PostgreSQLBackend):
-            self.backend_type = "postgresql"
-            self.backend_params = {
-                "host": storage.host,
-                "port": storage.port,
-                "database": storage.database,
-                "user": storage.user,
-                "password": storage.password
-            }
-        else:
-            raise ValueError(f"Unsupported storage backend: {type(storage)}")
+        self.backend_type = "sqlite"
+        self.backend_params = {"db_path": storage.db_path}
 
         logger.info(f"Using {self.num_workers} worker processes for minimax")
         logger.info(f"Backend: {self.backend_type}")
@@ -251,8 +234,15 @@ class ParallelMinimaxSolver:
                         # Instead: stream batches from database, solve, update
                         batch_solved_count = 0
                         offset = 0
+                        batch_num = 0
 
                         while True:
+                            batch_num += 1
+
+                            # Disk space check every 10 batches
+                            if batch_num % 10 == 0:
+                                self._check_disk_space()
+
                             # Fetch batch of unsolved positions
                             batch = self.storage.get_unsolved_positions_batch(
                                 seeds_in_pits, limit=self.batch_size, offset=offset
@@ -322,3 +312,56 @@ class ParallelMinimaxSolver:
             return start_pos.minimax_value
         else:
             raise RuntimeError("Failed to solve starting position")
+
+    def _check_disk_space(self):
+        """
+        Check disk space and raise exception if critically low.
+
+        Escape hatch to prevent filling up the disk during long solves.
+        """
+        import shutil
+        from pathlib import Path
+
+        try:
+            # Get database path from storage backend
+            if hasattr(self.storage, 'db_path'):
+                db_path = Path(self.storage.db_path)
+            else:
+                # Can't check disk without path
+                return
+
+            # Get disk usage stats
+            stat = shutil.disk_usage(db_path.parent)
+            free_gb = stat.free / (1024**3)
+            percent_free = (stat.free / stat.total) * 100 if stat.total > 0 else 0
+
+            # Critical threshold: 5GB or 5% free (whichever is more restrictive)
+            MIN_FREE_GB = 5.0
+            MIN_FREE_PERCENT = 5.0
+
+            if free_gb < MIN_FREE_GB or percent_free < MIN_FREE_PERCENT:
+                logger.error(
+                    f"DISK SPACE CRITICALLY LOW! "
+                    f"Free: {free_gb:.1f}GB ({percent_free:.1f}%) - "
+                    f"Stopping solve to prevent disk full"
+                )
+                raise RuntimeError(
+                    f"Disk space too low: {free_gb:.1f}GB free ({percent_free:.1f}%). "
+                    f"Need at least {MIN_FREE_GB}GB or {MIN_FREE_PERCENT}% free. "
+                    f"Stopping to prevent filling disk."
+                )
+
+            # Warning threshold: 10GB or 10% free
+            WARN_FREE_GB = 10.0
+            WARN_FREE_PERCENT = 10.0
+
+            if free_gb < WARN_FREE_GB or percent_free < WARN_FREE_PERCENT:
+                logger.warning(
+                    f"Disk space getting low: {free_gb:.1f}GB free ({percent_free:.1f}%)"
+                )
+        except RuntimeError:
+            # Re-raise disk full errors
+            raise
+        except Exception as e:
+            # Log but don't crash on disk check errors
+            logger.debug(f"Could not check disk space: {e}")

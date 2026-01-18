@@ -1,12 +1,5 @@
 # Core dependencies
 numpy>=1.24.0
-pyyaml>=6.0
-
-# Storage backends
-psycopg2-binary>=2.9.0  # PostgreSQL
-google-cloud-bigtable>=2.0.0  # Cloud Bigtable (optional)
-google-cloud-storage>=2.0.0   # Cloud Storage (optional)
-pyarrow>=12.0.0  # Parquet support
 
 # Testing
 pytest>=7.0.0
@@ -15,5 +8,3 @@ pytest-cov>=4.0.0
 # Development
 tqdm>=4.65.0  # Progress bars
 memory-profiler>=0.60.0  # Memory profiling
-black>=23.0.0  # Code formatting
-mypy>=1.0.0  # Type checking
