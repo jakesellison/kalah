@@ -20,8 +20,7 @@ class SQLiteBackend(StorageBackend):
     """
 
     def __init__(
-        self, db_path: str = "mancala.db", adaptive_cache: bool = True, fast_mode: bool = False,
-        create_schema: bool = True
+        self, db_path: str = "mancala.db", adaptive_cache: bool = True, wal_checkpoint_mb: int = 1024
     ):
         """
         Initialize SQLite backend.
@@ -29,35 +28,30 @@ class SQLiteBackend(StorageBackend):
         Args:
             db_path: Path to database file (use ":memory:" for in-memory)
             adaptive_cache: Use adaptive cache sizing based on available RAM
-            fast_mode: Disable durability (journal_mode=OFF, synchronous=OFF) for maximum speed
-                      WARNING: No crash recovery! Use for batch jobs where you can re-run if needed.
-            create_schema: If False, skip schema creation (for worker processes)
+            wal_checkpoint_mb: Checkpoint WAL when it exceeds this size in MB (default: 1GB)
         """
         self.db_path = db_path
         self.adaptive_cache = adaptive_cache
-        self.fast_mode = fast_mode
-        self.is_main_process = create_schema  # Only main process creates schema
-        # Set timeout to 30 seconds to handle concurrent access from worker processes
-        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
+        self.wal_checkpoint_mb = wal_checkpoint_mb
+        self.writes_since_checkpoint = 0
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row  # Enable dict-like access
-        if create_schema:
-            self._create_schema()
+        self._create_schema()
         self._optimize()
 
     def _create_schema(self) -> None:
-        """Create database schema (optimized for storage)."""
+        """Create database schema."""
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS positions (
-                state_hash BLOB NOT NULL,          -- 8 bytes (unsigned 64-bit)
-                state BLOB NOT NULL,               -- 9 bytes for Kalah(6,4) (bit-packed)
-                depth INTEGER NOT NULL,            -- 1 byte (depths 0-127)
-                seeds_in_pits INTEGER NOT NULL,    -- 1 byte (6-48 for Kalah(6,4))
-                minimax_value INTEGER,             -- 1 byte (-128 to 127)
-                best_move INTEGER                  -- 1 byte (0-5)
+                state_hash TEXT PRIMARY KEY,
+                state BLOB NOT NULL,
+                depth INTEGER NOT NULL,
+                seeds_in_pits INTEGER NOT NULL,
+                minimax_value INTEGER,
+                best_move INTEGER
             );
 
-            CREATE INDEX IF NOT EXISTS idx_state_hash ON positions(state_hash);
             CREATE INDEX IF NOT EXISTS idx_depth ON positions(depth);
             CREATE INDEX IF NOT EXISTS idx_seeds_in_pits ON positions(seeds_in_pits);
         """
@@ -86,114 +80,67 @@ class SQLiteBackend(StorageBackend):
         # Calculate mmap size (4x cache size, capped at 512MB)
         mmap_size = min(cache_size_mb * 4 * 1024 * 1024, 512 * 1024 * 1024)
 
-        if self.fast_mode:
-            # FAST MODE: No durability, maximum speed
-            # WARNING: Database can be corrupted if process crashes!
-            # Trade-off: 5-10x faster writes, but no crash recovery
-            # NOTE: No EXCLUSIVE locking - we need parallel worker access
-            self.conn.executescript(
-                f"""
-                PRAGMA journal_mode = OFF;           -- No journal (NO CRASH RECOVERY!)
-                PRAGMA synchronous = OFF;            -- Don't wait for disk writes (DANGEROUS!)
-                PRAGMA read_uncommitted = ON;        -- Allow dirty reads (reduces lock contention)
-                PRAGMA cache_size = {cache_size_kb}; -- Adaptive cache
-                PRAGMA temp_store = MEMORY;          -- Temp tables in memory
-                PRAGMA mmap_size = {mmap_size};      -- Adaptive memory-mapped I/O
-            """
-            )
-            # Only log warning in main process (workers would spam logs)
-            if self.is_main_process:
-                logger.warning("⚠️  FAST MODE ENABLED: No crash recovery! Database may corrupt if process dies.")
-                logger.info(f"SQLite fast mode: cache={cache_size_mb}MB, mmap={mmap_size // (1024*1024)}MB, journal=OFF, sync=OFF")
-        else:
-            # SAFE MODE: Standard durability with WAL
-            self.conn.executescript(
-                f"""
-                PRAGMA journal_mode = WAL;           -- Write-Ahead Logging
-                PRAGMA synchronous = NORMAL;         -- Balanced durability
-                PRAGMA cache_size = {cache_size_kb}; -- Adaptive cache
-                PRAGMA temp_store = MEMORY;          -- Temp tables in memory
-                PRAGMA mmap_size = {mmap_size};      -- Adaptive memory-mapped I/O
-            """
-            )
-            logger.debug(f"SQLite optimizations: cache={cache_size_mb}MB, mmap={mmap_size // (1024*1024)}MB")
+        self.conn.executescript(
+            f"""
+            PRAGMA journal_mode = WAL;           -- Write-Ahead Logging
+            PRAGMA synchronous = NORMAL;         -- Balanced durability
+            PRAGMA cache_size = {cache_size_kb}; -- Adaptive cache
+            PRAGMA temp_store = MEMORY;          -- Temp tables in memory
+            PRAGMA mmap_size = {mmap_size};      -- Adaptive memory-mapped I/O
+        """
+        )
+
+        logger.debug(f"SQLite optimizations: cache={cache_size_mb}MB, mmap={mmap_size // (1024*1024)}MB")
 
     def insert(self, position: Position) -> bool:
         """Insert single position."""
         try:
-            # Convert hash to bytes (8 bytes, big-endian, unsigned)
-            hash_bytes = position.state_hash.to_bytes(8, 'big', signed=False)
             self.conn.execute(
                 """
                 INSERT INTO positions (state_hash, state, depth, seeds_in_pits)
                 VALUES (?, ?, ?, ?)
             """,
-                (hash_bytes, position.state, position.depth, position.seeds_in_pits),
+                (str(position.state_hash), position.state, position.depth, position.seeds_in_pits),
             )
             return True
         except sqlite3.IntegrityError:  # Duplicate primary key
             return False
 
-    def insert_batch(self, positions: List[Position], allow_duplicates: bool = False) -> int:
-        """Bulk insert with optional deduplication.
-
-        Args:
-            positions: List of positions to insert
-            allow_duplicates: If True, use plain INSERT (faster, allows duplicates)
-                            If False, use INSERT OR IGNORE (deduplicates, slower)
-
-        Returns:
-            Number of positions attempted to insert (approximate)
-        """
+    def insert_batch(self, positions: List[Position]) -> int:
+        """Bulk insert with deduplication."""
+        # Use INSERT OR IGNORE for automatic deduplication
         cursor = self.conn.cursor()
-
-        if allow_duplicates:
-            # Plain INSERT - fast but allows duplicates
-            # Duplicates will be cleaned up later
-            cursor.executemany(
-                """
-                INSERT INTO positions (state_hash, state, depth, seeds_in_pits)
-                VALUES (?, ?, ?, ?)
-            """,
-                [
-                    (p.state_hash.to_bytes(8, 'big', signed=False), p.state, p.depth, p.seeds_in_pits)
-                    for p in positions
-                ],
-            )
-        else:
-            # INSERT OR IGNORE - deduplicates
-            cursor.executemany(
-                """
-                INSERT OR IGNORE INTO positions (state_hash, state, depth, seeds_in_pits)
-                VALUES (?, ?, ?, ?)
-            """,
-                [
-                    (p.state_hash.to_bytes(8, 'big', signed=False), p.state, p.depth, p.seeds_in_pits)
-                    for p in positions
-                ],
-            )
-
-        # Return attempted count (not necessarily actual inserts with OR IGNORE)
+        cursor.executemany(
+            """
+            INSERT OR IGNORE INTO positions (state_hash, state, depth, seeds_in_pits)
+            VALUES (?, ?, ?, ?)
+        """,
+            [
+                (str(p.state_hash), p.state, p.depth, p.seeds_in_pits)
+                for p in positions
+            ],
+        )
+        # SQLite doesn't provide rowcount for executemany with OR IGNORE
+        # We'll return the number we attempted to insert
+        # For accurate count, query before/after (expensive) or accept approximation
         return cursor.rowcount if cursor.rowcount > 0 else len(positions)
 
     def exists(self, state_hash: int) -> bool:
         """Check if position exists."""
-        hash_bytes = state_hash.to_bytes(8, 'big', signed=False)
         cursor = self.conn.execute(
-            "SELECT 1 FROM positions WHERE state_hash = ?", (hash_bytes,)
+            "SELECT 1 FROM positions WHERE state_hash = ?", (str(state_hash),)
         )
         return cursor.fetchone() is not None
 
     def get(self, state_hash: int) -> Optional[Position]:
         """Retrieve position by hash."""
-        hash_bytes = state_hash.to_bytes(8, 'big', signed=False)
         cursor = self.conn.execute(
-            "SELECT * FROM positions WHERE state_hash = ?", (hash_bytes,)
+            "SELECT * FROM positions WHERE state_hash = ?", (str(state_hash),)
         )
         row = cursor.fetchone()
         if row:
             return Position(
-                state_hash=int.from_bytes(row["state_hash"], 'big', signed=False),
+                state_hash=int(row["state_hash"]),
                 state=row["state"],
                 depth=row["depth"],
                 seeds_in_pits=row["seeds_in_pits"],
@@ -207,7 +154,7 @@ class SQLiteBackend(StorageBackend):
         cursor = self.conn.execute("SELECT * FROM positions WHERE depth = ?", (depth,))
         for row in cursor:
             yield Position(
-                state_hash=int.from_bytes(row["state_hash"], 'big', signed=False),
+                state_hash=int(row["state_hash"]),
                 state=row["state"],
                 depth=row["depth"],
                 seeds_in_pits=row["seeds_in_pits"],
@@ -231,7 +178,7 @@ class SQLiteBackend(StorageBackend):
         for row in cursor:
             positions.append(
                 Position(
-                    state_hash=int.from_bytes(row["state_hash"], 'big', signed=False),
+                    state_hash=int(row["state_hash"]),
                     state=row["state"],
                     depth=row["depth"],
                     seeds_in_pits=row["seeds_in_pits"],
@@ -248,7 +195,7 @@ class SQLiteBackend(StorageBackend):
         )
         for row in cursor:
             yield Position(
-                state_hash=int.from_bytes(row["state_hash"], 'big', signed=False),
+                state_hash=int(row["state_hash"]),
                 state=row["state"],
                 depth=row["depth"],
                 seeds_in_pits=row["seeds_in_pits"],
@@ -272,7 +219,7 @@ class SQLiteBackend(StorageBackend):
         for row in cursor:
             positions.append(
                 Position(
-                    state_hash=int.from_bytes(row["state_hash"], 'big', signed=False),
+                    state_hash=int(row["state_hash"]),
                     state=row["state"],
                     depth=row["depth"],
                     seeds_in_pits=row["seeds_in_pits"],
@@ -297,14 +244,13 @@ class SQLiteBackend(StorageBackend):
         self, state_hash: int, minimax_value: int, best_move: int
     ) -> None:
         """Update position with solution."""
-        hash_bytes = state_hash.to_bytes(8, 'big', signed=False)
         self.conn.execute(
             """
             UPDATE positions
             SET minimax_value = ?, best_move = ?
             WHERE state_hash = ?
         """,
-            (minimax_value, best_move, hash_bytes),
+            (minimax_value, best_move, str(state_hash)),
         )
 
     def count_positions(self, depth: Optional[int] = None) -> int:
@@ -323,9 +269,23 @@ class SQLiteBackend(StorageBackend):
         result = cursor.fetchone()[0]
         return result if result is not None else -1
 
+    def _check_wal_size(self) -> None:
+        """Check WAL file size and checkpoint if needed to prevent balloon."""
+        import os
+        wal_path = f"{self.db_path}-wal"
+        if os.path.exists(wal_path):
+            wal_size_mb = os.path.getsize(wal_path) / (1024 * 1024)
+            if wal_size_mb > self.wal_checkpoint_mb:
+                logger.info(f"WAL file is {wal_size_mb:.0f}MB, checkpointing...")
+                # TRUNCATE mode: blocks until checkpoint completes, then truncates WAL
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                logger.info("WAL checkpoint complete")
+
     def flush(self) -> None:
-        """Commit pending transactions."""
+        """Commit pending transactions and auto-checkpoint WAL if needed."""
         self.conn.commit()
+        # Memory-based WAL checkpoint to prevent balloon
+        self._check_wal_size()
 
     def close(self) -> None:
         """Close database connection."""

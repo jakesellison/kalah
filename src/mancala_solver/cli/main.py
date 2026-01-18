@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 
 from ..storage import SQLiteBackend
-from ..solver import ChunkedBFSSolver, ParallelMinimaxSolver
+from ..solver import ChunkedBFSSolver, ParallelMinimaxSolver, SimpleParallelBFSSolver, OriginalBFSSolver
 from ..solver.parallel_bfs import ParallelBFSSolver
 
 
@@ -38,7 +38,7 @@ def solve_command(args):
     db_path = Path(args.db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(f"Backend: SQLite ({args.db_path})")
-    storage = SQLiteBackend(str(db_path), fast_mode=args.fast_mode)
+    storage = SQLiteBackend(str(db_path))
 
     try:
         # Phase 1: BFS - select solver based on --solver flag
@@ -51,6 +51,23 @@ def solve_command(args):
                 num_workers=bfs_workers,
             )
             solver_name = "Parallel BFS"
+        elif args.solver == "simple":
+            logger.info(f"Using simple parallel BFS solver ({bfs_workers} workers)")
+            bfs_solver = SimpleParallelBFSSolver(
+                storage=storage,
+                num_pits=args.num_pits,
+                num_seeds=args.num_seeds,
+                num_workers=bfs_workers,
+            )
+            solver_name = "Simple Parallel BFS"
+        elif args.solver == "original":
+            logger.info("Using original BFS solver (single-threaded, all-in-memory)")
+            bfs_solver = OriginalBFSSolver(
+                storage=storage,
+                num_pits=args.num_pits,
+                num_seeds=args.num_seeds,
+            )
+            solver_name = "Original BFS"
         else:  # chunked
             logger.info("Using chunked BFS solver (single-threaded)")
             bfs_solver = ChunkedBFSSolver(
@@ -265,9 +282,9 @@ def main():
     )
     solve_parser.add_argument(
         "--solver",
-        choices=["parallel", "chunked"],
-        default="parallel",
-        help="BFS solver to use (parallel=multi-process, chunked=single-threaded)"
+        choices=["original", "simple", "parallel", "chunked"],
+        default="original",
+        help="BFS solver to use (original=single-thread baseline, simple=fast parallel, parallel=batch-of-chunks, chunked=single-threaded)"
     )
     solve_parser.set_defaults(func=solve_command)
 
