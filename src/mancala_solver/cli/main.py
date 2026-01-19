@@ -293,8 +293,8 @@ def main():
     )
     solve_parser.add_argument(
         "--db-path",
-        default="data/databases/kalah.db",
-        help="Path to SQLite database file",
+        default="databases/kalah.db",
+        help="Path to SQLite database file (default: databases/kalah.db)",
     )
     solve_parser.add_argument(
         "--workers", type=int, default=14, help="Number of parallel workers"
