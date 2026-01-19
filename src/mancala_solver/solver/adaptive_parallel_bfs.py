@@ -41,7 +41,7 @@ def _process_chunk_worker(
     limit: int,
     num_pits: int,
     num_seeds: int,
-) -> List[Position]:
+) -> tuple:
     """
     Worker function to process a chunk of positions.
 
@@ -58,8 +58,10 @@ def _process_chunk_worker(
         num_seeds: Initial seeds per pit
 
     Returns:
-        List of new Position objects (successors)
+        Tuple of (new_positions, read_time_sec, process_time_sec)
     """
+    import time
+
     # Initialize Zobrist hashing in this worker
     init_zobrist_table(num_pits)
 
@@ -71,13 +73,16 @@ def _process_chunk_worker(
         raise ValueError(f"Unsupported db_type: {db_type}")
 
     try:
-        # Fetch this chunk of positions
+        # Fetch this chunk of positions - TIME THIS
+        read_start = time.time()
         positions = storage.get_positions_at_depth_batch(depth, limit, offset)
+        read_time = time.time() - read_start
 
         if not positions:
-            return []
+            return ([], read_time, 0.0)
 
-        # Generate successors with local deduplication
+        # Generate successors with local deduplication - TIME THIS
+        process_start = time.time()
         new_positions = []
         local_seen: Set[int] = set()
 
@@ -104,7 +109,9 @@ def _process_chunk_worker(
                 )
                 new_positions.append(new_pos)
 
-        return new_positions
+        process_time = time.time() - process_start
+
+        return (new_positions, read_time, process_time)
 
     finally:
         storage.close()
@@ -258,9 +265,31 @@ class AdaptiveParallelBFSSolver:
 
         # Collect results as they complete
         all_new_positions = []
+        total_read_time = 0.0
+        total_process_time = 0.0
+        chunks_completed = 0
+
         for future in as_completed(futures):
-            chunk_results = future.result()
+            chunk_results, read_time, process_time = future.result()
             all_new_positions.extend(chunk_results)
+            total_read_time += read_time
+            total_process_time += process_time
+            chunks_completed += 1
+
+        # Log timing stats
+        avg_read_time = total_read_time / num_chunks if num_chunks > 0 else 0
+        avg_process_time = total_process_time / num_chunks if num_chunks > 0 else 0
+
+        if self.display:
+            self.display.log_info(
+                f"  ⏱ Avg per chunk: read={avg_read_time:.2f}s, process={avg_process_time:.2f}s "
+                f"(total read={total_read_time:.1f}s, process={total_process_time:.1f}s)"
+            )
+        else:
+            logger.info(
+                f"  ⏱ Parallel timing: avg read={avg_read_time:.2f}s/chunk, "
+                f"avg process={avg_process_time:.2f}s/chunk"
+            )
 
         return all_new_positions
 
