@@ -263,11 +263,12 @@ class AdaptiveParallelBFSSolver:
             )
             futures.append(future)
 
-        # Collect results as they complete
+        # Collect results as they complete and insert in batches
         all_new_positions = []
         total_read_time = 0.0
         total_process_time = 0.0
         chunks_completed = 0
+        BATCH_INSERT_SIZE = 1_000_000  # Insert and flush every 1M positions
 
         for future in as_completed(futures):
             chunk_results, read_time, process_time = future.result()
@@ -275,6 +276,14 @@ class AdaptiveParallelBFSSolver:
             total_read_time += read_time
             total_process_time += process_time
             chunks_completed += 1
+
+            # Periodically insert and flush to prevent WAL balloon
+            if len(all_new_positions) >= BATCH_INSERT_SIZE:
+                inserted = self.storage.insert_batch(all_new_positions)
+                self.total_generated += len(all_new_positions)
+                self.total_unique += inserted
+                self.storage.flush()  # Checkpoint WAL if needed
+                all_new_positions = []
 
         # Log timing stats
         avg_read_time = total_read_time / num_chunks if num_chunks > 0 else 0
@@ -374,6 +383,7 @@ class AdaptiveParallelBFSSolver:
                 self.total_generated += len(new_positions)
                 self.total_unique += inserted
 
+            # Flush after every depth (commits + checkpoints WAL if > 1GB)
             self.storage.flush()
 
             # Show resources every few depths
