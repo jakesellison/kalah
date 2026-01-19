@@ -269,7 +269,9 @@ class AdaptiveParallelBFSSolver:
         total_read_time = 0.0
         total_process_time = 0.0
         chunks_completed = 0
-        BATCH_INSERT_SIZE = 500_000  # Reduced from 1M - flush more aggressively
+        # Balance memory vs performance: flush every 5M positions
+        # At 4.6x growth, this is ~2-3 chunk results, limiting memory to ~6-10GB
+        BATCH_INSERT_SIZE = 5_000_000
         chunk_start_time = time.time()
 
         for future in as_completed(futures):
@@ -287,9 +289,10 @@ class AdaptiveParallelBFSSolver:
                 eta = remaining_chunks * avg_time_per_chunk
                 self.display.update_chunk_progress(chunks_completed, num_chunks, eta)
 
-            # Flush immediately if we have a large chunk result to prevent memory buildup
-            # Each chunk can generate 2-3M positions with high branching factors
-            if len(chunk_results) > 1_000_000 or len(all_new_positions) >= BATCH_INSERT_SIZE:
+            # Flush when accumulated positions exceed threshold
+            # This prevents constant flushing (which kills performance) while
+            # keeping memory bounded to ~10GB max
+            if len(all_new_positions) >= BATCH_INSERT_SIZE:
                 inserted = self.storage.insert_batch(all_new_positions)
                 self.total_generated += len(all_new_positions)
                 self.total_unique += inserted
