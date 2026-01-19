@@ -12,6 +12,8 @@ from ..storage import SQLiteBackend
 from ..solver import ChunkedBFSSolver, ParallelMinimaxSolver, SimpleParallelBFSSolver, OriginalBFSSolver
 from ..solver.parallel_bfs import ParallelBFSSolver
 from ..solver.adaptive_parallel_bfs import AdaptiveParallelBFSSolver
+from ..utils.resource_monitor import ResourceMonitor
+from ..utils.rich_display import SolverDisplay
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -32,24 +34,38 @@ def solve_command(args):
     bfs_workers = args.bfs_workers if args.bfs_workers is not None else args.workers
     minimax_workers = args.minimax_workers if args.minimax_workers is not None else args.workers
 
-    logger.info(f"Solving Kalah({args.num_pits},{args.num_seeds})")
-    logger.info(f"BFS workers: {bfs_workers}, Minimax workers: {minimax_workers}")
-
     # Initialize storage
     db_path = Path(args.db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Backend: SQLite ({args.db_path})")
     storage = SQLiteBackend(str(db_path))
+
+    # Initialize resource monitor and display
+    resource_monitor = ResourceMonitor(
+        db_path=str(db_path),
+        min_disk_gb=50.0,  # Abort if < 50GB free
+        max_ram_percent=90.0,  # Abort if > 90% RAM used
+    )
+    display = SolverDisplay(resource_monitor=resource_monitor)
+
+    # Show header
+    display.show_header(
+        f"Mancala Solver - Kalah({args.num_pits},{args.num_seeds})",
+        args.num_pits,
+        args.num_seeds,
+        bfs_workers
+    )
 
     try:
         # Phase 1: BFS - select solver based on --solver flag
         if args.solver == "adaptive":
-            logger.info(f"Using adaptive parallel BFS solver (max {bfs_workers} workers)")
+            display.log_info(f"Using adaptive parallel BFS solver (max {bfs_workers} workers)")
             bfs_solver = AdaptiveParallelBFSSolver(
                 storage=storage,
                 num_pits=args.num_pits,
                 num_seeds=args.num_seeds,
                 max_workers=bfs_workers,
+                display=display,
+                resource_monitor=resource_monitor,
             )
             solver_name = "Adaptive Parallel BFS"
         elif args.solver == "parallel":
@@ -88,9 +104,11 @@ def solve_command(args):
             )
             solver_name = "Chunked BFS"
 
-        logger.info("=" * 60)
-        logger.info(f"PHASE 1: Building game graph ({solver_name})")
-        logger.info("=" * 60)
+        display.log("")
+        display.log("[bold cyan]" + "=" * 60 + "[/bold cyan]")
+        display.log(f"[bold cyan]PHASE 1: Building game graph ({solver_name})[/bold cyan]")
+        display.log("[bold cyan]" + "=" * 60 + "[/bold cyan]")
+        display.log("")
         total_positions_with_dups = bfs_solver.build_game_graph()
 
         # Dedup cleanup: remove duplicates, keep minimum depth

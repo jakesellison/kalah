@@ -12,8 +12,7 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from math import ceil
-from typing import List, Set
-from tqdm import tqdm
+from typing import List, Set, Optional
 
 from ..core import (
     GameState,
@@ -25,6 +24,7 @@ from ..core import (
     init_zobrist_table,
 )
 from ..storage import StorageBackend, Position
+from ..utils.resource_monitor import ResourceMonitor, ResourceCheckError
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,8 @@ class AdaptiveParallelBFSSolver:
         num_seeds: int,
         batch_size: int = 100000,
         max_workers: int = None,
+        display: Optional[object] = None,
+        resource_monitor: Optional[ResourceMonitor] = None,
     ):
         """
         Initialize adaptive parallel BFS solver.
@@ -136,12 +138,16 @@ class AdaptiveParallelBFSSolver:
             num_seeds: Initial seeds per pit
             batch_size: Batch size for bulk inserts
             max_workers: Maximum number of workers (default: CPU count)
+            display: Optional SolverDisplay for rich output
+            resource_monitor: Optional ResourceMonitor for safety checks
         """
         self.storage = storage
         self.num_pits = num_pits
         self.num_seeds = num_seeds
         self.batch_size = batch_size
         self.max_workers = max_workers or os.cpu_count()
+        self.display = display
+        self.resource_monitor = resource_monitor
 
         # Initialize Zobrist hashing
         init_zobrist_table(num_pits)
@@ -156,7 +162,10 @@ class AdaptiveParallelBFSSolver:
 
         # Create worker pool once (reused throughout)
         self.pool = ProcessPoolExecutor(max_workers=self.max_workers)
-        logger.info(f"Created worker pool with {self.max_workers} workers")
+        if self.display:
+            self.display.log_info(f"Created worker pool with {self.max_workers} workers")
+        else:
+            logger.info(f"Created worker pool with {self.max_workers} workers")
 
     def __del__(self):
         """Cleanup worker pool on destruction."""
@@ -226,7 +235,11 @@ class AdaptiveParallelBFSSolver:
             List of all new positions generated
         """
         num_chunks = ceil(depth_size / CHUNK_SIZE)
-        logger.info(f"  → Parallel mode: {num_chunks} chunks of ~{CHUNK_SIZE:,} positions")
+        if self.display:
+            # Display will show this inline, no need for logger
+            pass
+        else:
+            logger.info(f"  → Parallel mode: {num_chunks} chunks of ~{CHUNK_SIZE:,} positions")
 
         # Submit all chunks to worker pool
         futures = []
@@ -258,13 +271,20 @@ class AdaptiveParallelBFSSolver:
         Returns:
             Total number of unique positions found
         """
-        logger.info(f"Starting adaptive parallel BFS for Kalah({self.num_pits},{self.num_seeds})")
-        logger.info(f"Workers: {self.max_workers}, Parallel threshold: {PARALLEL_THRESHOLD:,}")
+        if self.display:
+            self.display.log_info(f"Starting adaptive parallel BFS for Kalah({self.num_pits},{self.num_seeds})")
+            self.display.log_info(f"Workers: {self.max_workers}, Parallel threshold: {PARALLEL_THRESHOLD:,}")
+        else:
+            logger.info(f"Starting adaptive parallel BFS for Kalah({self.num_pits},{self.num_seeds})")
+            logger.info(f"Workers: {self.max_workers}, Parallel threshold: {PARALLEL_THRESHOLD:,}")
 
         # Check if already started
         max_depth = self.storage.get_max_depth()
         if max_depth >= 0:
-            logger.info(f"Resuming from depth {max_depth}")
+            if self.display:
+                self.display.log_info(f"Resuming from depth {max_depth}")
+            else:
+                logger.info(f"Resuming from depth {max_depth}")
             start_depth = max_depth
         else:
             # Insert starting position
@@ -277,58 +297,83 @@ class AdaptiveParallelBFSSolver:
             )
             self.storage.insert(start_pos)
             self.storage.flush()
-            logger.info("Inserted starting position")
+            if self.display:
+                self.display.log_info("Inserted starting position")
+            else:
+                logger.info("Inserted starting position")
             start_depth = 0
 
         depth = start_depth
-        with tqdm(desc="BFS", unit=" depth") as pbar:
-            while True:
-                # Count positions at this depth
-                depth_size = self.storage.count_positions(depth)
+        while True:
+            # Check resources periodically (every depth)
+            if self.resource_monitor:
+                is_safe, msg = self.resource_monitor.check_all()
+                if not is_safe:
+                    if self.display:
+                        self.display.log_error(msg)
+                    else:
+                        logger.error(msg)
+                    raise ResourceCheckError(msg)
 
-                if depth_size == 0:
-                    # No more positions - done!
-                    break
+            # Count positions at this depth
+            depth_size = self.storage.count_positions(depth)
 
-                pbar.set_description(f"Depth {depth} ({depth_size:,} positions)")
+            if depth_size == 0:
+                # No more positions - done!
+                break
 
-                # Decide: single-threaded or parallel?
-                if depth_size < PARALLEL_THRESHOLD:
-                    # Single-threaded fast path
-                    new_positions = self._process_depth_single_threaded(depth)
-                else:
-                    # Parallel chunked path
-                    new_positions = self._process_depth_parallel(depth, depth_size)
+            # Decide: single-threaded or parallel?
+            mode = "single" if depth_size < PARALLEL_THRESHOLD else "parallel"
+            num_chunks = ceil(depth_size / CHUNK_SIZE) if mode == "parallel" else 0
 
-                # Insert remaining positions
-                if new_positions:
-                    inserted = self.storage.insert_batch(new_positions)
-                    self.total_generated += len(new_positions)
-                    self.total_unique += inserted
+            # Show depth info
+            total_in_db = self.storage.count_positions()
+            if self.display:
+                self.display.update_depth_info(depth, depth_size, mode, num_chunks, total_in_db)
 
-                self.storage.flush()
+            # Process depth
+            if depth_size < PARALLEL_THRESHOLD:
+                # Single-threaded fast path
+                new_positions = self._process_depth_single_threaded(depth)
+            else:
+                # Parallel chunked path
+                new_positions = self._process_depth_parallel(depth, depth_size)
 
-                total_in_db = self.storage.count_positions()
-                logger.info(
-                    f"Depth {depth}: {depth_size:,} positions -> "
-                    f"generated successors -> total in DB: {total_in_db:,}"
-                )
+            # Insert remaining positions
+            if new_positions:
+                inserted = self.storage.insert_batch(new_positions)
+                self.total_generated += len(new_positions)
+                self.total_unique += inserted
 
-                pbar.update(1)
-                depth += 1
+            self.storage.flush()
+
+            # Show resources every few depths
+            if self.display and self.resource_monitor and depth % 3 == 0:
+                self.display.show_resources_inline()
+
+            depth += 1
 
         total_positions = self.storage.count_positions()
-        logger.info(f"BFS complete! Total positions: {total_positions:,}")
-        logger.info(f"Maximum depth: {depth - 1}")
-        logger.info(
-            f"Duplication rate: {(1 - self.total_unique/self.total_generated)*100:.1f}%"
-            if self.total_generated > 0
-            else "N/A"
-        )
+        if self.display:
+            self.display.log_success(f"BFS complete! Total positions: {total_positions:,}")
+            self.display.log_info(f"Maximum depth: {depth - 1}")
+            if self.total_generated > 0:
+                self.display.log_info(f"Duplication rate: {(1 - self.total_unique/self.total_generated)*100:.1f}%")
+        else:
+            logger.info(f"BFS complete! Total positions: {total_positions:,}")
+            logger.info(f"Maximum depth: {depth - 1}")
+            logger.info(
+                f"Duplication rate: {(1 - self.total_unique/self.total_generated)*100:.1f}%"
+                if self.total_generated > 0
+                else "N/A"
+            )
 
         # Shutdown worker pool
         self.pool.shutdown(wait=True)
-        logger.info("Worker pool shutdown complete")
+        if self.display:
+            self.display.log_info("Worker pool shutdown complete")
+        else:
+            logger.info("Worker pool shutdown complete")
 
         return total_positions
 

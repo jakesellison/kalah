@@ -35,6 +35,8 @@ ENV/
 data/
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.log
 .DS_Store
 
