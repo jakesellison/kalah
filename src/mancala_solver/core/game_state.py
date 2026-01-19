@@ -112,8 +112,13 @@ def pack_state(state: GameState) -> bytes:
     """
     Pack game state into compact byte representation.
 
-    Uses 5 bits per position (supports 0-31 seeds), plus 1 bit for player.
-    For Kalah(6,4): 14 positions × 5 bits + 1 bit = 71 bits ≈ 9 bytes
+    Uses 6 bits per position (supports 0-63 seeds), plus 1 bit for player.
+    This handles all Kalah variants up to 63 total seeds per position:
+    - Kalah(4,3): 24 total seeds ✓
+    - Kalah(6,4): 48 total seeds ✓
+    - Kalah(6,6): 72 total seeds (need 7 bits - would fail, but uncommon)
+
+    For Kalah(6,4): 14 positions × 6 bits + 1 bit = 85 bits = 11 bytes
 
     Args:
         state: GameState to pack
@@ -122,20 +127,20 @@ def pack_state(state: GameState) -> bytes:
         Packed bytes representation
     """
     num_positions = len(state.board)
-    bits_per_position = 5
+    bits_per_position = 6  # Fixed 6 bits per position (max 63 seeds)
     total_bits = num_positions * bits_per_position + 1  # +1 for player bit
 
     # Calculate byte array size
     num_bytes = (total_bits + 7) // 8  # Ceiling division
     packed = bytearray(num_bytes)
 
-    # Pack each position (5 bits each)
+    # Pack each position (6 bits each)
     bit_offset = 0
     for seeds in state.board:
-        if seeds > 31:
-            raise ValueError(f"Cannot pack {seeds} seeds (max 31 with 5 bits)")
+        if seeds > 63:
+            raise ValueError(f"Cannot pack {seeds} seeds (max 63 with 6 bits)")
 
-        # Write 5 bits for this position
+        # Write 6 bits for this position
         for i in range(bits_per_position):
             if seeds & (1 << i):
                 byte_idx = bit_offset // 8
@@ -156,6 +161,10 @@ def unpack_state(packed: bytes, num_pits: int) -> GameState:
     """
     Unpack byte representation back to GameState.
 
+    Auto-detects format based on byte length:
+    - Old format: 5 bits per position (Kalah(6,4) = 9 bytes)
+    - New format: 6 bits per position (Kalah(6,4) = 11 bytes)
+
     Args:
         packed: Packed bytes from pack_state()
         num_pits: Number of pits per player
@@ -164,12 +173,23 @@ def unpack_state(packed: bytes, num_pits: int) -> GameState:
         Reconstructed GameState
     """
     num_positions = 2 * num_pits + 2
-    bits_per_position = 5
+
+    # Auto-detect format based on byte length
+    expected_bytes_5bit = ((num_positions * 5 + 1) + 7) // 8
+    expected_bytes_6bit = ((num_positions * 6 + 1) + 7) // 8
+
+    if len(packed) == expected_bytes_5bit:
+        bits_per_position = 5  # Old format
+    elif len(packed) == expected_bytes_6bit:
+        bits_per_position = 6  # New format
+    else:
+        # Default to 6 bits for new states
+        bits_per_position = 6
 
     board = []
     bit_offset = 0
 
-    # Unpack each position (5 bits each)
+    # Unpack each position
     for _ in range(num_positions):
         seeds = 0
         for i in range(bits_per_position):
