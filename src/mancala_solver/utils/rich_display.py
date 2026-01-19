@@ -122,7 +122,7 @@ class SolverDisplay:
 
         return table
 
-    def update_depth_info(self, depth: int, positions: int, mode: str = "single", chunks: int = 0, total_db: int = 0):
+    def update_depth_info(self, depth: int, positions: int, mode: str = "single", chunks: int = 0, total_db: int = 0, prev_depth_positions: int = 0):
         """Update depth processing information."""
         mode_str = f"[yellow]Parallel ({chunks} chunks)[/yellow]" if mode == "parallel" else "[green]Single-thread[/green]"
 
@@ -132,10 +132,30 @@ class SolverDisplay:
             mode_str,
         ]
 
+        # Show growth factor if we have previous depth
+        if prev_depth_positions > 0 and positions > 0:
+            growth = positions / prev_depth_positions
+            info_parts.append(f"[dim]({growth:.1f}x growth)[/dim]")
+
         if total_db > 0:
             info_parts.append(f"Total: {total_db:,}")
 
         self.log_info(" | ".join(info_parts))
+
+    def update_chunk_progress(self, completed: int, total: int, eta_seconds: float = None):
+        """Update progress for parallel chunk processing."""
+        percent = (completed / total * 100) if total > 0 else 0
+        bar_width = 20
+        filled = int(bar_width * completed / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        eta_str = ""
+        if eta_seconds is not None and eta_seconds > 0:
+            mins = int(eta_seconds / 60)
+            secs = int(eta_seconds % 60)
+            eta_str = f" [dim](ETA: {mins}m {secs}s)[/dim]"
+
+        console.print(f"  [cyan]Chunks:[/cyan] {bar} {completed}/{total} ({percent:.0f}%){eta_str}", end="\r")
 
     def update_seed_info(self, seeds: int, positions: int, iterations: int):
         """Update minimax seed layer information."""

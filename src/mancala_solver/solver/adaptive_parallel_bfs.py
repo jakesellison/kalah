@@ -10,6 +10,7 @@ Strategy:
 
 import logging
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from math import ceil
 from typing import List, Set, Optional
@@ -269,6 +270,7 @@ class AdaptiveParallelBFSSolver:
         total_process_time = 0.0
         chunks_completed = 0
         BATCH_INSERT_SIZE = 1_000_000  # Insert and flush every 1M positions
+        chunk_start_time = time.time()
 
         for future in as_completed(futures):
             chunk_results, read_time, process_time = future.result()
@@ -277,6 +279,14 @@ class AdaptiveParallelBFSSolver:
             total_process_time += process_time
             chunks_completed += 1
 
+            # Update progress bar
+            if self.display:
+                elapsed = time.time() - chunk_start_time
+                avg_time_per_chunk = elapsed / chunks_completed if chunks_completed > 0 else 0
+                remaining_chunks = num_chunks - chunks_completed
+                eta = remaining_chunks * avg_time_per_chunk
+                self.display.update_chunk_progress(chunks_completed, num_chunks, eta)
+
             # Periodically insert and flush to prevent WAL balloon
             if len(all_new_positions) >= BATCH_INSERT_SIZE:
                 inserted = self.storage.insert_batch(all_new_positions)
@@ -284,6 +294,11 @@ class AdaptiveParallelBFSSolver:
                 self.total_unique += inserted
                 self.storage.flush()  # Checkpoint WAL if needed
                 all_new_positions = []
+
+        # Clear progress bar line
+        if self.display:
+            from rich.console import Console
+            Console().print("")  # Move to next line after progress bar
 
         # Log timing stats
         avg_read_time = total_read_time / num_chunks if num_chunks > 0 else 0
@@ -342,6 +357,7 @@ class AdaptiveParallelBFSSolver:
             start_depth = 0
 
         depth = start_depth
+        prev_depth_size = 0
         while True:
             # Check resources periodically (every depth)
             if self.resource_monitor:
@@ -364,10 +380,10 @@ class AdaptiveParallelBFSSolver:
             mode = "single" if depth_size < PARALLEL_THRESHOLD else "parallel"
             num_chunks = ceil(depth_size / CHUNK_SIZE) if mode == "parallel" else 0
 
-            # Show depth info
+            # Show depth info with growth factor
             total_in_db = self.storage.count_positions()
             if self.display:
-                self.display.update_depth_info(depth, depth_size, mode, num_chunks, total_in_db)
+                self.display.update_depth_info(depth, depth_size, mode, num_chunks, total_in_db, prev_depth_size)
 
             # Process depth
             if depth_size < PARALLEL_THRESHOLD:
@@ -390,6 +406,8 @@ class AdaptiveParallelBFSSolver:
             if self.display and self.resource_monitor and depth % 3 == 0:
                 self.display.show_resources_inline()
 
+            # Track for growth factor calculation
+            prev_depth_size = depth_size
             depth += 1
 
         total_positions = self.storage.count_positions()
