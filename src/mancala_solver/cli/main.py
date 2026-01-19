@@ -11,6 +11,7 @@ from pathlib import Path
 from ..storage import SQLiteBackend
 from ..solver import ChunkedBFSSolver, ParallelMinimaxSolver, SimpleParallelBFSSolver, OriginalBFSSolver
 from ..solver.parallel_bfs import ParallelBFSSolver
+from ..solver.adaptive_parallel_bfs import AdaptiveParallelBFSSolver
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -42,7 +43,16 @@ def solve_command(args):
 
     try:
         # Phase 1: BFS - select solver based on --solver flag
-        if args.solver == "parallel":
+        if args.solver == "adaptive":
+            logger.info(f"Using adaptive parallel BFS solver (max {bfs_workers} workers)")
+            bfs_solver = AdaptiveParallelBFSSolver(
+                storage=storage,
+                num_pits=args.num_pits,
+                num_seeds=args.num_seeds,
+                max_workers=bfs_workers,
+            )
+            solver_name = "Adaptive Parallel BFS"
+        elif args.solver == "parallel":
             logger.info(f"Using parallel BFS solver ({bfs_workers} workers)")
             bfs_solver = ParallelBFSSolver(
                 storage=storage,
@@ -282,9 +292,9 @@ def main():
     )
     solve_parser.add_argument(
         "--solver",
-        choices=["original", "simple", "parallel", "chunked"],
-        default="original",
-        help="BFS solver to use (original=single-thread baseline, simple=fast parallel, parallel=batch-of-chunks, chunked=single-threaded)"
+        choices=["adaptive", "original", "simple", "parallel", "chunked"],
+        default="adaptive",
+        help="BFS solver to use (adaptive=scales workers based on depth size, original=single-thread baseline, simple=fast parallel, parallel=batch-of-chunks, chunked=single-threaded)"
     )
     solve_parser.set_defaults(func=solve_command)
 

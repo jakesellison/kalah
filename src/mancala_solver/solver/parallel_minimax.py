@@ -37,8 +37,8 @@ def _worker_init(backend_type: str, backend_params: dict, num_pits: int) -> None
     global _worker_storage, _worker_num_pits
     from ..storage import SQLiteBackend
 
-    # Workers don't create schema - main process already did
-    _worker_storage = SQLiteBackend(backend_params["db_path"], create_schema=False)
+    # Workers create their own connection (schema uses CREATE IF NOT EXISTS, so safe)
+    _worker_storage = SQLiteBackend(backend_params["db_path"])
     _worker_num_pits = num_pits
     init_zobrist_table(num_pits)
 
