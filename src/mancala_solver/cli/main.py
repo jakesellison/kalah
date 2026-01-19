@@ -16,18 +16,30 @@ from ..utils.resource_monitor import ResourceMonitor
 from ..utils.rich_display import SolverDisplay
 
 
-def setup_logging(level: str = "INFO") -> None:
+def setup_logging(level: str = "INFO", log_file: str = None) -> None:
     """Configure logging."""
+    handlers = [logging.StreamHandler()]
+
+    if log_file:
+        # Add file handler for logging
+        file_handler = logging.FileHandler(log_file, mode='w')
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        handlers.append(file_handler)
+
     logging.basicConfig(
         level=getattr(logging, level.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
     )
 
 
 def solve_command(args):
     """Solve a Kalah variant."""
-    setup_logging(args.log_level)
+    log_file = args.log_file if hasattr(args, 'log_file') else None
+    setup_logging(args.log_level, log_file)
     logger = logging.getLogger(__name__)
 
     # Determine worker counts for each phase
@@ -313,6 +325,10 @@ def main():
         choices=["adaptive", "original", "simple", "parallel", "chunked"],
         default="adaptive",
         help="BFS solver to use (adaptive=scales workers based on depth size, original=single-thread baseline, simple=fast parallel, parallel=batch-of-chunks, chunked=single-threaded)"
+    )
+    solve_parser.add_argument(
+        "--log-file",
+        help="Path to log file (optional, logs to file while showing pretty output on screen)"
     )
     solve_parser.set_defaults(func=solve_command)
 
